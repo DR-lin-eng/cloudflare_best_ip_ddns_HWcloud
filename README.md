@@ -9,6 +9,7 @@
 ## 简介
 
 **DDNS Updater** 是一个用于动态测试优选 [Cloudflare IP](https://www.cloudflare.com/) 更新的 Python 脚本，支持 IPv4 和 IPv6 地址的自动更新。该脚本使用华为云 DNS 服务，确保您的域名始终指向最佳的 Cloudflare IP 地址，提升访问速度和稳定性。
+### 注意：使用前需要修改脚本内的主域名和子域名等信息再使用，建议直接部署，docker部署可能会遇到ipv6的问题请注意
 
 ## 目录
 
