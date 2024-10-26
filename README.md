@@ -1,61 +1,106 @@
 # cloudflare_best_ip_ddns_HWcloud
 # 以下readme由ai生成
-DDNS Updater Docker 部署指南
-项目简介
-DDNS Updater 是一个用于动态测试优选cloudflare ip更新的 Python 脚本，支持 IPv4 和 IPv6 地址的自动更新。该脚本使用华为云 DNS 服务，通过 Docker 容器化部署，确保高效、可靠地运行，并且能够轻松管理和监控日志文件。
+# DDNS Updater
 
-目录
-前提条件
-安装和部署步骤
-1. 克隆或下载项目
-2. 创建 requirements.txt
-3. 编写 Dockerfile
-4. 创建自定义 Docker 网络
-5. 构建 Docker 镜像
-6. 创建日志文件
-7. 运行 Docker 容器
-8. 验证部署
-9. 使用 Docker Compose（可选）
-查看日志
-停止和移除容器
-常见问题排查
-安全性提示
-许可证
-前提条件
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Python Version](https://img.shields.io/badge/python-3.12-blue.svg)
+![Docker](https://img.shields.io/badge/docker-19.03%2B-blue.svg)
+
+## 简介
+
+**DDNS Updater** 是一个用于动态测试优选 [Cloudflare IP](https://www.cloudflare.com/) 更新的 Python 脚本，支持 IPv4 和 IPv6 地址的自动更新。该脚本使用华为云 DNS 服务，确保您的域名始终指向最佳的 Cloudflare IP 地址，提升访问速度和稳定性。
+
+## 目录
+
+- [特点](#特点)
+- [前提条件](#前提条件)
+- [安装和部署](#安装和部署)
+  - [1. 克隆仓库](#1-克隆仓库)
+  - [2. 创建自定义 Docker 网络](#2-创建自定义-docker-网络)
+  - [3. 构建 Docker 镜像](#3-构建-docker-镜像)
+  - [4. 创建日志文件](#4-创建日志文件)
+  - [5. 运行 Docker 容器](#5-运行-docker-容器)
+  - [6. 验证部署](#6-验证部署)
+- [使用 Docker Compose](#使用-docker-compose)
+- [查看日志](#查看日志)
+- [停止和移除容器](#停止和移除容器)
+- [常见问题排查](#常见问题排查)
+- [安全性提示](#安全性提示)
+- [许可证](#许可证)
+
+## 特点
+
+- **动态测试**：定期测试并优选 Cloudflare 的最佳 IP 地址。
+- **IPv4 和 IPv6 支持**：同时支持 IPv4 和 IPv6 地址的自动更新。
+- **华为云 DNS 集成**：使用华为云 DNS 服务进行域名解析更新。
+- **Docker 容器化**：通过 Docker 容器化部署，简化安装和管理。
+- **日志管理**：日志文件自动映射到主机，便于监控和调试。
+
+## 前提条件
+
 在开始之前，请确保您的系统满足以下要求：
 
-操作系统：Linux（推荐使用 Ubuntu 或 CentOS）
-Docker：已安装并运行
-安装指南：Docker 官方文档
-Docker Compose（可选）：用于简化多容器管理
-安装指南：Docker Compose 官方文档
-华为云账号：拥有 DNS 服务的访问密钥（ACCESS_KEY 和 SECRET_KEY）
-安装和部署步骤
-1. 克隆或下载项目
+1. **操作系统**：Linux（推荐使用 Ubuntu 或 CentOS）
+2. **Docker**：已安装并运行
+   - 安装指南：[Docker 官方文档](https://docs.docker.com/get-docker/)
+3. **Docker Compose**（可选）：用于简化多容器管理
+   - 安装指南：[Docker Compose 官方文档](https://docs.docker.com/compose/install/)
+4. **华为云账号**：拥有 DNS 服务的访问密钥（`ACCESS_KEY` 和 `SECRET_KEY`）
+
+## 安装和部署
+
+### 1. 克隆仓库
+
 首先，克隆本项目的仓库到您的本地机器：
 
-bash
-复制代码
-git clone https://github.com/your-repo/ddns_updater.git
-cd ddns_updater
-如果您没有使用 Git，可以直接下载项目压缩包并解压到目标目录。
+```bash
+git clone https://github.com/DR-lin-eng/cloudflare_best_ip_ddns_HWcloud.git
+cd cloudflare_best_ip_ddns_HWcloud
+```
 
-2. 创建 requirements.txt
-确保项目目录中有一个 requirements.txt 文件，列出所有 Python 依赖项。内容如下：
+*如果您没有使用 Git，可以直接下载项目压缩包并解压到目标目录。*
 
-plaintext
-复制代码
-aiohttp
-requests
-huaweicloudsdkcore
-huaweicloudsdkdns
-如果您已经有 requirements.txt 文件，可以跳过此步骤。
+### 2. 创建自定义 Docker 网络
 
-3. 编写 Dockerfile
-在项目根目录中创建一个名为 Dockerfile 的文件，并添加以下内容：
+为了确保容器具有独立的 IPv4 和 IPv6 地址，创建一个支持 IPv6 的自定义桥接网络。
 
-dockerfile
-复制代码
+**注意**：在创建网络之前，请确保选择的子网不与现有 Docker 网络重叠。
+
+```bash
+docker network create \
+  --driver bridge \
+  --ipv6 \
+  --subnet 172.30.0.0/16 \
+  --subnet 2001:db8:2::/64 \
+  custom-bridge-net
+```
+
+**常见错误**：
+
+- **子网重叠**：如果出现 `Pool overlaps with other one on this address space` 错误，选择不同的子网范围。例如：
+
+  ```bash
+  docker network create \
+    --driver bridge \
+    --ipv6 \
+    --subnet 172.31.0.0/16 \
+    --subnet 2001:db8:3::/64 \
+    custom-bridge-net
+  ```
+
+**验证网络创建**：
+
+```bash
+docker network inspect custom-bridge-net
+```
+
+### 3. 构建 Docker 镜像
+
+确保您的 `Dockerfile` 已正确配置并安装了必要的网络工具。
+
+#### 示例 `Dockerfile`
+
+```dockerfile
 # 使用官方轻量级 Python 基础镜像
 FROM python:3.12-slim
 
@@ -82,142 +127,80 @@ ENV SECRET_KEY=""
 
 # 定义容器启动时运行的命令
 CMD ["python", "测活.py"]
-说明：
+```
 
-iproute2：提供 ip 命令。
-iputils-ping：提供 ping6 命令。
-curl：用于网络请求。
-4. 创建自定义 Docker 网络
-为了确保容器具有独立的 IPv4 和 IPv6 地址，创建一个支持 IPv6 的自定义桥接网络。
+#### 构建镜像
 
-注意：在创建网络之前，请确保选择的子网不与现有 Docker 网络重叠。
-
-bash
-复制代码
-docker network create \
-  --driver bridge \
-  --ipv6 \
-  --subnet 172.30.0.0/16 \
-  --subnet 2001:db8:2::/64 \
-  custom-bridge-net
-常见错误：
-
-子网重叠：如果出现 Pool overlaps with other one on this address space 错误，选择不同的子网范围。例如：
-
-bash
-复制代码
-docker network create \
-  --driver bridge \
-  --ipv6 \
-  --subnet 172.31.0.0/16 \
-  --subnet 2001:db8:3::/64 \
-  custom-bridge-net
-验证网络创建：
-
-bash
-复制代码
-docker network inspect custom-bridge-net
-应看到类似以下内容：
-
-json
-复制代码
-[
-    {
-        "Name": "custom-bridge-net",
-        "Id": "a1b2c3d4e5f6...",
-        "Created": "2024-04-27T10:05:00.000000000Z",
-        "Scope": "local",
-        "Driver": "bridge",
-        "EnableIPv6": true,
-        "IPAM": {
-            "Driver": "default",
-            "Options": {},
-            "Config": [
-                {
-                    "Subnet": "172.30.0.0/16",
-                    "Gateway": "172.30.0.1"
-                },
-                {
-                    "Subnet": "2001:db8:2::/64",
-                    "Gateway": "2001:db8:2::1"
-                }
-            ]
-        },
-        ...
-    }
-]
-5. 构建 Docker 镜像
 在项目目录中运行以下命令构建 Docker 镜像：
 
-bash
-复制代码
+```bash
 docker build -t ddns_updater .
-说明：
+```
 
--t ddns_updater：为镜像命名为 ddns_updater。
-.：指定 Dockerfile 位于当前目录。
-6. 创建日志文件
-确保在主机的当前目录中存在 ddns_update.log 文件，用于存储容器内的日志。
+### 4. 创建日志文件
 
-bash
-复制代码
+确保在主机的当前目录中存在 `ddns_update.log` 文件，用于存储容器内的日志。
+
+```bash
 touch ddns_update.log
-如果您使用 Windows，可以使用以下命令：
+```
 
-powershell
-复制代码
-New-Item ddns_update.log -ItemType File -Force
-7. 运行 Docker 容器
+### 5. 运行 Docker 容器
+
 使用自定义桥接网络运行容器，并映射日志文件，同时传递环境变量。
 
-bash
-复制代码
+```bash
 docker run -d \
   --name ddns_updater \
   --network custom-bridge-net \
-  -e ACCESS_KEY=S4YPA8LYCGG95FEFE6SQ \
-  -e SECRET_KEY=vpyvWlKgV2UdKeuf0iIacFevSBZwTTzKiaA0SCjV \
+  -e ACCESS_KEY=你的_ACCESS_KEY_ \
+  -e SECRET_KEY=你的_SECRET_KEY_ \
   -v "$(pwd)/ddns_update.log:/app/ddns_update.log" \
   ddns_updater
-说明：
+```
 
--d：以后台模式运行容器。
---name ddns_updater：为容器命名为 ddns_updater。
---network custom-bridge-net：将容器连接到自定义桥接网络。
--e ACCESS_KEY=... 和 -e SECRET_KEY=...：通过环境变量传递华为云密钥。请确保替换为您的实际密钥。
--v "$(pwd)/ddns_update.log:/app/ddns_update.log"：将主机当前目录中的 ddns_update.log 文件映射到容器内的 /app/ddns_update.log。
-Windows 用户：
+**说明**：
 
-在 PowerShell 中，使用反引号（`）作为换行符：
+- 请替换 `你的_ACCESS_KEY_` 和 `你的_SECRET_KEY_` 为您的华为云密钥。
 
-powershell
-复制代码
-docker run -d `
-  --name ddns_updater `
-  --network custom-bridge-net `
-  -e ACCESS_KEY=S4YPA8LYCGG95FEFE6SQ `
-  -e SECRET_KEY=vpyvWlKgV2UdKeuf0iIacFevSBZwTTzKiaA0SCjV `
-  -v "${PWD}\ddns_update.log:/app/ddns_update.log" `
-  ddns_updater
-8. 查看容器的 IP 地址
+### 6. 验证部署
+
+#### 查看容器是否正在运行
+
+```bash
+docker ps
+```
+
+应看到类似以下内容：
+
+```
+CONTAINER ID   IMAGE           COMMAND                  CREATED          STATUS          PORTS     NAMES
+abcdef123456   ddns_updater    "python 测活.py"        10 seconds ago   Up 8 seconds              ddns_updater
+```
+
+#### 查看容器的 IP 地址
+
 使用以下命令查看容器在自定义网络中的 IPv4 和 IPv6 地址：
 
-bash
-复制代码
+```bash
 docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}}{{end}}' ddns_updater
-示例输出：
+```
 
-ruby
-复制代码
+**示例输出**：
+
+```
 172.30.0.2 2001:db8:2::2
-9. 使用 Docker Compose（可选）
-为了简化部署和管理，可以使用 Docker Compose。以下是详细的配置和步骤。
+```
 
-a. 创建 docker-compose.yml
-在项目目录中创建一个名为 docker-compose.yml 的文件，并添加以下内容：
+## 使用 Docker Compose
 
-yaml
-复制代码
+为了简化部署和管理，您可以使用 Docker Compose。以下是详细的步骤和配置文件。
+
+### 1. 创建 `docker-compose.yml`
+
+在项目目录中创建一个名为 `docker-compose.yml` 的文件，并添加以下内容：
+
+```yaml
 version: '3.8'
 
 services:
@@ -238,159 +221,95 @@ networks:
   custom-bridge-net:
     external: true
     name: custom-bridge-net
-说明：
+```
 
-network_mode 替换为连接到 custom-bridge-net。
-ipv6_address：可选，手动指定容器的 IPv6 地址。
-environment：通过环境变量传递 ACCESS_KEY 和 SECRET_KEY。
-volumes：映射日志文件。
-restart: unless-stopped：确保容器在崩溃后自动重启，除非手动停止。
-b. 创建 .env 文件
-为了管理环境变量，创建一个 .env 文件并添加以下内容：
+### 2. 创建 `.env` 文件
 
-dotenv
-复制代码
-ACCESS_KEY=S4YPA8LYCGG95FEFE6SQ
-SECRET_KEY=vpyvWlKgV2UdKeuf0iIacFevSBZwTTzKiaA0SCjV
-安全性提示：绝对不要 将 .env 文件提交到版本控制系统（如 Git）。在 .gitignore 文件中添加 .env 以防止意外泄露。
+为了管理环境变量，创建一个 `.env` 文件并添加以下内容：
 
-c. 运行 Docker Compose
+```dotenv
+ACCESS_KEY=你的_ACCESS_KEY_
+SECRET_KEY=你的_SECRET_KEY_
+```
+
+**安全性提示**：**绝对不要** 将 `.env` 文件提交到版本控制系统（如 Git）。在 `.gitignore` 文件中添加 `.env` 以防止意外泄露。
+
+### 3. 运行 Docker Compose
+
 在项目目录中运行以下命令启动容器：
 
-bash
-复制代码
+```bash
 docker-compose up -d
-说明：
+```
 
-up：构建并启动容器。
--d：以后台模式运行。
-d. 查看容器的 IP 地址
-使用以下命令查看容器在自定义网络中的 IPv4 和 IPv6 地址：
+### 4. 查看实时日志
 
-bash
-复制代码
-docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{.GlobalIPv6Address}}{{end}}' ddns_updater
-示例输出：
-
-ruby
-复制代码
-172.30.0.2 2001:db8:2::10
-e. 查看实时日志
 要实时查看容器的日志，可以使用以下命令：
 
-bash
-复制代码
+```bash
 docker-compose logs -f
-或者使用 Docker CLI：
+```
 
-bash
-复制代码
-docker logs -f ddns_updater
-查看日志
-日志文件 ddns_update.log 被映射到主机的当前目录，您可以通过以下方式查看日志：
+## 查看日志
 
-bash
-复制代码
+日志文件 `ddns_update.log` 被映射到主机的当前目录，您可以通过以下方式查看日志：
+
+```bash
 cat ddns_update.log
-或者使用 tail 实时查看新增日志：
+```
 
-bash
-复制代码
+或使用 `tail` 实时查看新增日志：
+
+```bash
 tail -f ddns_update.log
-停止和移除容器
-使用 Docker CLI
-停止容器：
+```
 
-bash
-复制代码
-docker stop ddns_updater
-移除容器：
+## 停止和移除容器
 
-bash
-复制代码
-docker rm ddns_updater
-使用 Docker Compose
-停止并移除容器：
+### 使用 Docker CLI
 
-bash
-复制代码
-docker-compose down
-常见问题排查
-问题 1：创建网络时子网重叠
-错误信息：
+1. **停止容器**：
 
-csharp
-复制代码
-Error response from daemon: Pool overlaps with other one on this address space
-解决方案：
+   ```bash
+   docker stop ddns_updater
+   ```
 
-选择一个不与现有 Docker 网络重叠的子网。例如，将子网更改为 172.31.0.0/16 和 2001:db8:3::/64。
-问题 2：容器内无法使用 IPv6
-检查步骤：
+2. **移除容器**：
 
-进入容器：
+   ```bash
+   docker rm ddns_updater
+   ```
 
-bash
-复制代码
-docker exec -it ddns_updater /bin/bash
-检查 IPv6 地址：
+### 使用 Docker Compose
 
-bash
-复制代码
-ip -6 addr show
-测试 IPv6 连接：
+1. **停止并移除容器**：
 
-bash
-复制代码
-ping6 baidu.com
-curl -6 http://ipv6.google.com
-可能原因及解决方法：
+   ```bash
+   docker-compose down
+   ```
 
-网络配置错误：确保自定义网络正确配置了 IPv6 子网。
-防火墙阻挡：检查主机防火墙设置，确保允许 IPv6 流量。
-应用程序不支持 IPv6：确保 Python 脚本正确处理 IPv6 地址。
-问题 3：容器内缺少命令或工具
-解决方案：
+## 安全性提示
 
-确保 Dockerfile 中安装了必要的工具 (iproute2、iputils-ping 和 curl)。
+1. **保护敏感信息**：
+   - **不要** 在 `Dockerfile` 中硬编码 `ACCESS_KEY` 和 `SECRET_KEY`。
+   - 使用 `.env` 文件或 Docker Secrets 管理环境变量。
+   - 确保 `.env` 文件不被提交到版本控制系统。
 
-重新构建镜像：
+2. **限制容器权限**：
+   - 使用非 root 用户运行容器（可在 `Dockerfile` 中设置）。
+   - 仅挂载必要的卷，限制对主机文件系统的访问。
 
-bash
-复制代码
-docker build -t ddns_updater .
-问题 4：环境变量未正确传递
-解决方案：
+3. **定期更新镜像和依赖**：
+   - 使用最新的基础镜像和依赖库，以修复已知的安全漏洞。
 
-确认 .env 文件位于项目目录中，并且包含正确的 ACCESS_KEY 和 SECRET_KEY。
-检查 docker-compose.yml 是否正确引用了环境变量。
-问题 5：日志文件未正确映射
-解决方案：
+4. **防火墙配置**：
+   - 确保主机防火墙仅允许必要的流量，尤其是在开放 IPv6 端口时。
 
-确认主机上的 ddns_update.log 文件路径正确，并且具有写权限。
+## 许可证
 
-检查挂载选项是否正确：
+本项目采用 [MIT 许可证](LICENSE)。
 
-bash
-复制代码
--v "$(pwd)/ddns_update.log:/app/ddns_update.log"
-安全性提示
-保护敏感信息：
+---
 
-不要 在 Dockerfile 中硬编码 ACCESS_KEY 和 SECRET_KEY。
-使用 .env 文件或 Docker Secrets 管理环境变量。
-确保 .env 文件不被提交到版本控制系统。
-限制容器权限：
+**感谢您使用 DDNS Updater！** 如果您有任何问题或建议，请随时联系项目维护者或提交 [Issue](https://github.com/DR-lin-eng/cloudflare_best_ip_ddns_HWcloud/issues)。
 
-使用非 root 用户运行容器（可在 Dockerfile 中设置）。
-仅挂载必要的卷，限制对主机文件系统的访问。
-定期更新镜像和依赖：
-
-使用最新的基础镜像和依赖库，以修复已知的安全漏洞。
-防火墙配置：
-
-确保主机防火墙仅允许必要的流量，尤其是在开放 IPv6 端口时。
-许可证
-本项目采用 MIT 许可证。
-
-感谢您使用 DDNS Updater！ 如果您有任何问题或建议，请随时联系项目维护者或提交 Issue。
