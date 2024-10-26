@@ -1,0 +1,570 @@
+import re
+import time
+import asyncio
+import random
+import ipaddress
+import os
+import logging
+import socket
+import aiohttp
+
+# 依赖导入检查
+try:
+    import requests
+except ImportError:
+    print("缺少依赖模块 'requests'。请运行 'pip install requests' 安装。")
+    exit(1)
+
+try:
+    from huaweicloudsdkcore.auth.credentials import BasicCredentials
+    from huaweicloudsdkcore.exceptions import exceptions
+    from huaweicloudsdkdns.v2 import DnsClient
+    from huaweicloudsdkdns.v2.region.dns_region import DnsRegion
+    from huaweicloudsdkdns.v2.model.list_public_zones_request import ListPublicZonesRequest
+    from huaweicloudsdkdns.v2.model.list_record_sets_request import ListRecordSetsRequest
+    from huaweicloudsdkdns.v2.model.update_record_set_request import UpdateRecordSetRequest
+    from huaweicloudsdkdns.v2.model.update_record_set_req import UpdateRecordSetReq
+    from huaweicloudsdkdns.v2.model.create_record_set_request import CreateRecordSetRequest
+    from huaweicloudsdkdns.v2.model.create_record_set_request_body import CreateRecordSetRequestBody
+except ImportError as e:
+    print(f"缺少华为云SDK依赖模块。请运行 'pip install huaweicloudsdkcore huaweicloudsdkdns' 安装。错误信息：{e}")
+    exit(1)
+
+# 配置参数
+ACCESS_KEY = os.getenv("ACCESS_KEY") or "替换为您的 ACCESS_KEY"  # 替换为您的 ACCESS_KEY
+SECRET_KEY = os.getenv("SECRET_KEY") or "替换为您的 SECRET_KEY"  # 替换为您的 SECRET_KEY
+DOMAIN_NAME = "hwcdn.lzf.email"  # 主域名
+SUB_DOMAIN_NAME = "cdn.hwcdn.lzf.email."  # 子域名
+REGION = "cn-north-1"  # 替换为您的项目区域
+TTL = 300
+REFRESH_INTERVAL = 1800  # 刷新间隔时间，单位为秒（30分钟）
+MAX_VALID_IPS_V4 = 10  # 每次更新的最大有效IPv4数
+MAX_VALID_IPS_V6 = 10  # 每次更新的最大有效IPv6数
+MAX_IP_SELECTION_V4 = 1000  # 每次循环选择的最大IPv4数
+MAX_IP_SELECTION_V6 = 1000  # 每次循环选择的最大IPv6数
+SUCCESS_IP_FILE_V4 = "successful_ips_v4.txt"  # 成功IPv4列表文件
+SUCCESS_IP_FILE_V6 = "successful_ips_v6.txt"  # 成功IPv6列表文件
+HIGH_QUALITY_IP_PROPORTION = 0.7  # 高质量IP选择比例
+CONCURRENT_LIMIT = 200  # 并发限制，避免过多协程导致资源耗尽
+TCP_CONNECT_TIMEOUT = 1  # TCP连接超时时间，单位为秒
+PING_TIMES = 2  # 每个IP的ping次数
+HTTP_TIMEOUT = 2  # HTTP请求超时时间，单位为秒
+HTTP_STATUS_CODES = [200, 301, 302]  # 期望的HTTP状态码
+TARGET_COLOS = []  # 目标机场三字码列表，例如 ["HKG", "SJC"]
+LINE_TYPE = '中国大陆'  # 解析线路类型（已移除）
+
+# 文件路径
+ipv4_file = "ips-v4.txt"
+ipv6_file = "ips-v6.txt"
+
+# 文件下载链接
+ipv4_url = "https://alist.linzefeng.top/d/mega/ip/ips-v4.txt?sign=grsBXBSxn4DUs2WAsYVXzsXU4112S8-FNugrtU--_Po=:0"
+ipv6_url = "https://alist.linzefeng.top/d/mega/ip/ips-v6.txt?sign=yVIw7FtfHsX2EYSvg-PdljuJhTGTaL_zTpePfI7pvFs=:0"
+
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,  # 控制台输出INFO及以上级别的日志
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("ddns_update.log"),  # 日志文件
+        logging.StreamHandler()  # 控制台
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# 检查配置文件是否存在，如果不存在则下载
+def check_and_download_file(file_path, url):
+    if not os.path.exists(file_path):
+        logger.info(f"文件 {file_path} 不存在，正在从 {url} 下载...")
+        try:
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(response.text)
+            logger.info(f"文件 {file_path} 下载成功。")
+        except Exception as e:
+            logger.exception(f"下载文件 {file_path} 时出错：{e}")
+            exit(1)
+
+check_and_download_file(ipv4_file, ipv4_url)
+check_and_download_file(ipv6_file, ipv6_url)
+
+# 检查ACCESS_KEY和SECRET_KEY是否已配置
+if ACCESS_KEY == "你的ACCESS_KEY" or SECRET_KEY == "你的SECRET_KEY":
+    logger.error("请在脚本中配置您的 ACCESS_KEY 和 SECRET_KEY，或将其设置为环境变量。")
+    exit(1)
+
+# 初始化认证并创建DNS客户端
+try:
+    credentials = BasicCredentials(ACCESS_KEY, SECRET_KEY)
+    client = DnsClient.new_builder().with_credentials(credentials).with_region(DnsRegion.value_of(REGION)).build()
+except exceptions.ClientRequestException as e:
+    logger.exception("初始化华为云DNS客户端失败，请检查您的密钥和区域配置。")
+    exit(1)
+
+def list_all_zones(client):
+    try:
+        req = ListPublicZonesRequest()
+        resp = client.list_public_zones(req)
+        if resp and hasattr(resp, 'status_code') and resp.status_code < 300:
+            zones = resp.to_dict().get('zones', [])
+            logger.info("当前可用的DNS区域：")
+            for zone in zones:
+                logger.info(f"- {zone['name']} (ID: {zone['id']})")
+        else:
+            logger.error("无法获取DNS区域列表。")
+    except exceptions.ClientRequestException as e:
+        logger.exception(f'获取 DNS 区域列表失败：{e}')
+
+def get_zone(domain_name, client):
+    logger.info(f'正在获取 ZONE_ID，域名: {domain_name}')
+    try:
+        req = ListPublicZonesRequest()
+        # 直接使用完整的主域名作为ZONE_NAME
+        req.name = domain_name.strip('.') + '.'
+        resp = client.list_public_zones(req)
+        if not resp or not hasattr(resp, 'status_code') or resp.status_code >= 300:
+            logger.error(f'获取 ZONE 失败，状态码: {getattr(resp, "status_code", "无响应状态码")}')
+            return None
+        zones = resp.to_dict().get('zones', [])
+        for zone in zones:
+            if req.name.strip('.') == zone['name'].strip('.'):
+                logger.info(f'找到匹配的 ZONE，ZONE_ID: {zone["id"]}')
+                return zone['id']
+        logger.error('找不到匹配的 ZONE，请检查主域名是否正确。')
+    except exceptions.ClientRequestException as e:
+        logger.exception(f'获取 ZONE 失败：{e}')
+    return None
+
+def load_cidr_list(file_path):
+    cidr_list = []
+    if not os.path.exists(file_path):
+        logger.warning(f"文件未找到: {file_path}")
+    else:
+        try:
+            with open(file_path, 'r') as f:
+                logger.info(f'开始读取 IP 地址段文件: {file_path}')
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        cidr_list.append(line)
+        except Exception as e:
+            logger.exception(f'读取文件时出错 {file_path}：{e}')
+    logger.info(f'共 {len(cidr_list)} 个CIDR地址段需要处理')
+    return cidr_list
+
+def get_random_ips(cidr_list, num_ips, ip_version):
+    ips = set()
+    total_cidrs = len(cidr_list)
+    if total_cidrs == 0:
+        return list(ips)
+    ips_per_cidr = max(1, num_ips // total_cidrs)
+    for cidr in cidr_list:
+        try:
+            network = ipaddress.ip_network(cidr, strict=False)
+            if network.version != ip_version:
+                continue
+            num_hosts = network.num_addresses - 2 if network.version == 4 else network.num_addresses
+            if num_hosts <= 0:
+                continue
+            count = min(ips_per_cidr, num_ips - len(ips))
+            for _ in range(count):
+                random_ip_int = random.randint(1, num_hosts - 1)
+                random_ip = str(network.network_address + random_ip_int)
+                ips.add(random_ip)
+                if len(ips) >= num_ips:
+                    break
+            if len(ips) >= num_ips:
+                break
+        except ValueError as ve:
+            logger.warning(f'无效的CIDR地址段 "{cidr}"：{ve}')
+    return list(ips)
+
+def load_successful_ips(file_path):
+    successful_ips = set()
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r') as f:
+                for line in f:
+                    ip = line.strip()
+                    if ip:
+                        successful_ips.add(ip)
+            logger.info(f'加载成功IP列表 {file_path}，共 {len(successful_ips)} 个IP')
+        except Exception as e:
+            logger.exception(f'加载成功IP列表时出错：{e}')
+    else:
+        logger.info(f'成功IP列表文件 {file_path} 不存在，将创建新的成功IP列表。')
+    return successful_ips
+
+def save_successful_ips(file_path, successful_ips):
+    try:
+        with open(file_path, 'w') as f:
+            for ip in successful_ips:
+                f.write(f"{ip}\n")
+        logger.debug(f'保存成功IP列表 {file_path}，共 {len(successful_ips)} 个IP')
+    except Exception as e:
+        logger.exception(f'保存成功IP列表时出错：{e}')
+
+async def tcping(ip):
+    try:
+        # 使用 asyncio.open_connection 进行异步 TCP 连接测试
+        if ':' in ip:
+            # IPv6
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 80, family=socket.AF_INET6), timeout=TCP_CONNECT_TIMEOUT)
+        else:
+            # IPv4
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, 80, family=socket.AF_INET), timeout=TCP_CONNECT_TIMEOUT)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+# 正则表达式匹配机场三字码
+colo_regexp = re.compile(r'[A-Z]{3}')
+
+def get_colo_from_header(headers):
+    cf_ray = headers.get('CF-RAY', '')
+    x_amz_cf_pop = headers.get('X-Amz-Cf-Pop', '')
+    if cf_ray:
+        colo = cf_ray.split('-')[-1]
+        if colo_regexp.match(colo):
+            return colo
+    elif x_amz_cf_pop:
+        colo = x_amz_cf_pop[:3]
+        if colo_regexp.match(colo):
+            return colo
+    return ''
+
+async def check_status(session, ip):
+    try:
+        headers = {
+            "Host": "zhiyao02.cn",
+            "User-Agent": "Mozilla/5.0",
+            "Connection": "keep-alive",
+        }
+        url = f"http://[{ip}]" if ':' in ip else f"http://{ip}"
+        async with session.head(url, headers=headers, timeout=HTTP_TIMEOUT, allow_redirects=False) as response:
+            status_code = response.status
+            if status_code not in HTTP_STATUS_CODES:
+                return False
+            # 提取机场三字码
+            colo = get_colo_from_header(response.headers)
+            if TARGET_COLOS:
+                if colo not in TARGET_COLOS:
+                    return False
+            return True
+    except Exception:
+        return False
+
+def update_or_create_record(client, zone_id, name, ips, record_type='A', ttl=300):
+    try:
+        # 使用 ListRecordSetsRequest 来查询现有的记录
+        req = ListRecordSetsRequest()
+        req.zone_id = zone_id
+        req.name = name
+        req.type = record_type
+        resp = client.list_record_sets(req)
+        recordsets = resp.to_dict().get('recordsets', [])
+
+        if recordsets:
+            # 如果存在记录，则更新
+            recordset_id = recordsets[0]['id']
+            update_req = UpdateRecordSetRequest(
+                zone_id=zone_id,
+                recordset_id=recordset_id,
+                body=UpdateRecordSetReq(
+                    name=name,
+                    type=record_type,
+                    ttl=ttl,
+                    records=ips
+                    # 移除 line 参数，使用默认线路
+                )
+            )
+            update_resp = client.update_record_set(update_req)
+            if hasattr(update_resp, 'status_code') and update_resp.status_code < 300:
+                logger.info(f'更新解析成功: {name} -> {ips}')
+            else:
+                logger.error(f'更新解析失败: 状态码 {getattr(update_resp, "status_code", "无响应状态码")}')
+        else:
+            # 如果不存在记录，则创建
+            create_req = CreateRecordSetRequest(
+                zone_id=zone_id,
+                body=CreateRecordSetRequestBody(
+                    name=name,
+                    type=record_type,
+                    ttl=ttl,
+                    records=ips
+                    # 移除 line 参数，使用默认线路
+                )
+            )
+            create_resp = client.create_record_set(create_req)
+            if hasattr(create_resp, 'status_code') and create_resp.status_code < 300:
+                logger.info(f'创建解析成功: {name} -> {ips}')
+            else:
+                logger.error(f'创建解析失败: 状态码 {getattr(create_resp, "status_code", "无响应状态码")}')
+    except exceptions.ClientRequestException as e:
+        logger.exception(f'更新或创建解析失败：{e}')
+
+async def auto_refresh_dns():
+    logger.info('开始自动刷新DNS流程')
+    
+    # 列出所有DNS区域
+    list_all_zones(client)
+    
+    zone_id = get_zone(DOMAIN_NAME, client)
+    if not zone_id:
+        logger.error('无法获取 ZONE_ID，程序退出。')
+        return
+
+    # 加载成功IP列表
+    successful_ips_v4 = load_successful_ips(SUCCESS_IP_FILE_V4)
+    successful_ips_v6 = load_successful_ips(SUCCESS_IP_FILE_V6)
+
+    # 读取 CIDR 列表
+    cidr_list_v4 = load_cidr_list(ipv4_file)
+    cidr_list_v6 = load_cidr_list(ipv6_file)
+    if not cidr_list_v4 and not cidr_list_v6:
+        logger.error('未找到有效的CIDR地址段，请检查您的IP地址段文件。')
+        return
+
+    current_ipv4_ips = set()
+    current_ipv6_ips = set()
+
+    # 初始化HTTP会话
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    connector = aiohttp.TCPConnector(limit=CONCURRENT_LIMIT, family=socket.AF_UNSPEC)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        while True:
+            valid_ipv4_ips = set()
+            valid_ipv6_ips = set()
+            ip_test_results = []
+
+            # -------------------- IPv4 处理 --------------------
+            logger.info('开始处理 IPv4 地址...')
+            # 计算要从成功IP中选择的数量
+            selected_high_quality_count_v4 = min(len(successful_ips_v4), int(MAX_IP_SELECTION_V4 * HIGH_QUALITY_IP_PROPORTION))
+            selected_random_count_v4 = MAX_IP_SELECTION_V4 - selected_high_quality_count_v4
+
+            # 选择成功IP
+            if selected_high_quality_count_v4 > 0:
+                selected_successful_ips_v4 = random.sample(list(successful_ips_v4), selected_high_quality_count_v4)
+            else:
+                selected_successful_ips_v4 = []
+
+            # 从 CIDR 中随机生成 IP
+            logger.info('开始从 IPv4 CIDR 中随机生成 IP...')
+            sampled_random_ips_v4 = get_random_ips(cidr_list_v4, selected_random_count_v4, ip_version=4)
+            logger.info(f'生成了 {len(sampled_random_ips_v4)} 个随机IPv4地址')
+
+            # 合并选择的IP
+            selected_ips_v4 = selected_successful_ips_v4 + sampled_random_ips_v4
+            logger.info(f'总共选择了 {len(selected_ips_v4)} 个IPv4地址进行测试')
+
+            # 如果没有IP，继续循环直到找到合适的IP
+            if not selected_ips_v4:
+                logger.warning('没有可选的IPv4地址进行测试，等待5秒后重试...')
+                await asyncio.sleep(5)
+                continue
+
+            # 控制并发数
+            semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+
+            # 执行tcping/ping任务
+            logger.info('开始执行 IPv4 tcping/ping任务...')
+
+            async def test_ip_v4(ip):
+                async with semaphore:
+                    total_delay = 0
+                    success = 0
+                    for _ in range(PING_TIMES):
+                        start_time = time.time()
+                        result = await tcping(ip)
+                        if result:
+                            success += 1
+                            total_delay += time.time() - start_time
+                    if success > 0:
+                        avg_delay = total_delay / success
+                        return ip, True, avg_delay
+                    else:
+                        return ip, False, None
+
+            ping_tasks_v4 = [test_ip_v4(ip) for ip in selected_ips_v4]
+            ping_results_list_v4 = await asyncio.gather(*ping_tasks_v4)
+            ping_results_v4 = {ip: (success, delay) for ip, success, delay in ping_results_list_v4}
+
+            # 执行check_status任务
+            logger.info('开始执行 IPv4 check_status任务...')
+
+            async def check_ip_status_v4(ip):
+                async with semaphore:
+                    result = await check_status(session, ip)
+                    return ip, result
+
+            ips_to_check_v4 = [ip for ip, (success, _) in ping_results_v4.items() if success]
+            if not ips_to_check_v4:
+                logger.warning('没有可用的IPv4地址通过了tcping测试，等待5秒后重试...')
+                await asyncio.sleep(5)
+                continue
+
+            check_status_tasks_v4 = [check_ip_status_v4(ip) for ip in ips_to_check_v4]
+            check_status_results_list_v4 = await asyncio.gather(*check_status_tasks_v4)
+            check_status_results_v4 = dict(check_status_results_list_v4)
+
+            # 汇总有效IP并更新成功IP列表
+            logger.info('汇总有效IPv4地址并更新成功IP列表...')
+            for ip in selected_ips_v4:
+                ping_success, delay = ping_results_v4.get(ip, (False, None))
+                status_result = check_status_results_v4.get(ip, False)
+                ip_test_results.append({'ip': ip, 'ping': ping_success, 'status': status_result, 'delay': delay})
+
+                if ping_success and status_result:
+                    valid_ipv4_ips.add(ip)
+                    successful_ips_v4.add(ip)  # 添加到成功IP列表
+                    logger.info(f'IPv4地址 {ip} 测试通过，添加到成功IP列表')
+                else:
+                    if ip in successful_ips_v4:
+                        successful_ips_v4.remove(ip)
+                        logger.warning(f'IPv4地址 {ip} 测试失败，已从成功IP列表中移除。')
+
+            # -------------------- IPv6 处理 --------------------
+            logger.info('开始处理 IPv6 地址...')
+            # 计算要从成功IP中选择的数量
+            selected_high_quality_count_v6 = min(len(successful_ips_v6), int(MAX_IP_SELECTION_V6 * HIGH_QUALITY_IP_PROPORTION))
+            selected_random_count_v6 = MAX_IP_SELECTION_V6 - selected_high_quality_count_v6
+
+            # 选择成功IP
+            if selected_high_quality_count_v6 > 0:
+                selected_successful_ips_v6 = random.sample(list(successful_ips_v6), selected_high_quality_count_v6)
+            else:
+                selected_successful_ips_v6 = []
+
+            # 从 CIDR 中随机生成 IP
+            logger.info('开始从 IPv6 CIDR 中随机生成 IP...')
+            sampled_random_ips_v6 = get_random_ips(cidr_list_v6, selected_random_count_v6, ip_version=6)
+            logger.info(f'生成了 {len(sampled_random_ips_v6)} 个随机IPv6地址')
+
+            # 合并选择的IP
+            selected_ips_v6 = selected_successful_ips_v6 + sampled_random_ips_v6
+            logger.info(f'总共选择了 {len(selected_ips_v6)} 个IPv6地址进行测试')
+
+            # 如果没有IP，继续循环直到找到合适的IP
+            if not selected_ips_v6:
+                logger.warning('没有可选的IPv6地址进行测试，等待5秒后重试...')
+                await asyncio.sleep(5)
+                continue
+
+            # 执行tcping/ping任务
+            logger.info('开始执行 IPv6 tcping/ping任务...')
+
+            async def test_ip_v6(ip):
+                async with semaphore:
+                    total_delay = 0
+                    success = 0
+                    for _ in range(PING_TIMES):
+                        start_time = time.time()
+                        result = await tcping(ip)
+                        if result:
+                            success += 1
+                            total_delay += time.time() - start_time
+                    if success > 0:
+                        avg_delay = total_delay / success
+                        return ip, True, avg_delay
+                    else:
+                        return ip, False, None
+
+            ping_tasks_v6 = [test_ip_v6(ip) for ip in selected_ips_v6]
+            ping_results_list_v6 = await asyncio.gather(*ping_tasks_v6)
+            ping_results_v6 = {ip: (success, delay) for ip, success, delay in ping_results_list_v6}
+
+            # 执行check_status任务
+            logger.info('开始执行 IPv6 check_status任务...')
+
+            async def check_ip_status_v6(ip):
+                async with semaphore:
+                    result = await check_status(session, ip)
+                    return ip, result
+
+            ips_to_check_v6 = [ip for ip, (success, _) in ping_results_v6.items() if success]
+            if not ips_to_check_v6:
+                logger.warning('没有可用的IPv6地址通过了tcping测试，等待5秒后重试...')
+                await asyncio.sleep(5)
+                continue
+
+            check_status_tasks_v6 = [check_ip_status_v6(ip) for ip in ips_to_check_v6]
+            check_status_results_list_v6 = await asyncio.gather(*check_status_tasks_v6)
+            check_status_results_v6 = dict(check_status_results_list_v6)
+
+            # 汇总有效IP并更新成功IP列表
+            logger.info('汇总有效IPv6地址并更新成功IP列表...')
+            for ip in selected_ips_v6:
+                ping_success, delay = ping_results_v6.get(ip, (False, None))
+                status_result = check_status_results_v6.get(ip, False)
+                ip_test_results.append({'ip': ip, 'ping': ping_success, 'status': status_result, 'delay': delay})
+
+                if ping_success and status_result:
+                    valid_ipv6_ips.add(ip)
+                    successful_ips_v6.add(ip)  # 添加到成功IP列表
+                    logger.info(f'IPv6地址 {ip} 测试通过，添加到成功IP列表')
+                else:
+                    if ip in successful_ips_v6:
+                        successful_ips_v6.remove(ip)
+                        logger.warning(f'IPv6地址 {ip} 测试失败，已从成功IP列表中移除。')
+
+            # 更新DNS记录
+            # 更新IPv4记录
+            if valid_ipv4_ips:
+                new_ipv4_ips = set(random.sample(list(valid_ipv4_ips), min(MAX_VALID_IPS_V4, len(valid_ipv4_ips))))
+                if new_ipv4_ips != current_ipv4_ips:
+                    logger.info(f'正在更新IPv4 DNS记录，新的IP: {new_ipv4_ips}')
+                    update_or_create_record(client, zone_id, SUB_DOMAIN_NAME, list(new_ipv4_ips), 'A', TTL)
+                    current_ipv4_ips = new_ipv4_ips
+                else:
+                    logger.info('IPv4地址未改变，无需更新。')
+            else:
+                logger.warning('没有找到合适的IPv4地址来更新DNS记录，继续尝试...')
+
+            # 更新IPv6记录
+            if valid_ipv6_ips:
+                new_ipv6_ips = set(random.sample(list(valid_ipv6_ips), min(MAX_VALID_IPS_V6, len(valid_ipv6_ips))))
+                if new_ipv6_ips != current_ipv6_ips:
+                    logger.info(f'正在更新IPv6 DNS记录，新的IP: {new_ipv6_ips}')
+                    update_or_create_record(client, zone_id, SUB_DOMAIN_NAME, list(new_ipv6_ips), 'AAAA', TTL)
+                    current_ipv6_ips = new_ipv6_ips
+                else:
+                    logger.info('IPv6地址未改变，无需更新。')
+            else:
+                logger.warning('没有找到合适的IPv6地址来更新DNS记录，继续尝试...')
+
+            # 保存成功IP列表
+            logger.info('保存成功IP列表...')
+            save_successful_ips(SUCCESS_IP_FILE_V4, successful_ips_v4)
+            save_successful_ips(SUCCESS_IP_FILE_V6, successful_ips_v6)
+
+            # 将测试结果写入文件
+            logger.info('将测试结果写入ip.csv...')
+            try:
+                with open('ip.csv', 'w', encoding='utf-8') as csv_file:
+                    csv_file.write('IP,Ping Success,Status Check Result,Average Delay\n')
+                    for result in ip_test_results:
+                        csv_file.write(f"{result['ip']},{result['ping']},{result['status']},{result['delay']}\n")
+                logger.info('测试结果已写入 ip.csv')
+            except Exception as e:
+                logger.exception(f'写入 CSV 文件时出错：{e}')
+
+            # 如果找到合适的IP，等待下一个刷新周期；否则立即继续
+            if valid_ipv4_ips or valid_ipv6_ips:
+                logger.info(f'等待 {REFRESH_INTERVAL // 60} 分钟后进行下一次刷新。')
+                await asyncio.sleep(REFRESH_INTERVAL)
+            else:
+                logger.info('未找到合适的IP地址，立即开始下一轮尝试。')
+                continue
+
+if __name__ == "__main__":
+    logger.info("华为云 DDNS 自动更新脚本启动！")
+    try:
+        asyncio.run(auto_refresh_dns())
+    except KeyboardInterrupt:
+        logger.info("程序已手动终止。")
+    except Exception as e:
+        logger.exception(f'程序运行时发生未处理的异常：{e}')
